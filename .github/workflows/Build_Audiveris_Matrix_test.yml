@@ -24,18 +24,21 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || (github.event_name == 'release' && github.event.release.tag_name || '') }}
 
-      - name: Set up JDK 25 (Early Access)
+      - name: Set up JDK 25 (stable)
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'    # Eclipse Adoptium Temurin 提供 EA 版本
-          java-version: '25-ea'
+          distribution: 'temurin'        # Eclipse Adoptium 提供稳定版 JDK
+          java-version: '25'              # 稳定版本号
           check-latest: true
+
+      - name: Verify Java version
+        run: java -version
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Build with Gradle
-        run: ./gradlew build --no-daemon
+        run: ./gradlew build --no-daemon --stacktrace
 
       - name: Prepare Termux package structure
         run: |
