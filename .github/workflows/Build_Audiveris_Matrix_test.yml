@@ -14,76 +14,129 @@ on:
         required: true
         default: 'development'
 
+permissions:
+  contents: read
+
 jobs:
   build-termux-arm64:
-    # 使用 GitHub 提供的 ARM64 运行器（公开仓库可用）
+    # 使用 GitHub 原生 ARM64 运行器（公开仓库可用）
     runs-on: ubuntu-24.04-arm
-    # 如果 ubuntu-24.04-arm 不可用，可尝试 ubuntu-22.04-arm 或 ubuntu-latest（但需 QEMU 模拟）
-    # 注意：ARM64 运行器目前处于 beta，若不可用可回退到 ubuntu-latest 并通过 QEMU 模拟（但速度慢）
+
+    env:
+      # Tesseract 数据路径（与官方 CI 保持一致）
+      TESSDATA_PREFIX: /home/runner/.config/AudiverisLtd/audiveris/tessdata
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || (github.event_name == 'release' && github.event.release.tag_name || '') }}
+          fetch-depth: 0
 
-      # 安装构建依赖（Tesseract 开发库，用于 JNI 编译）
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr libtesseract-dev
-
-      - name: Set up JDK 25 (stable, ARM64)
-        uses: actions/setup-java@v4
+      # 读取 gradle.properties 获取 Java 版本和 Tessdata 标签
+      - name: Retrieve Gradle properties
+        uses: BrycensRanch/read-properties-action@v1
+        id: props
         with:
-          distribution: 'temurin'
-          java-version: '25'
-          architecture: aarch64   # 明确指定 ARM64 架构
-          check-latest: true
+          file: gradle.properties
+          all: true
 
-      - name: Verify Java version and architecture
+      # 安装 ARM64 版本的 JDK（项目要求的最低版本）
+      - name: Setup Java ${{ steps.props.outputs.theMinJavaVersion }} (ARM64)
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ steps.props.outputs.theMinJavaVersion }}
+          distribution: 'zulu'
+          architecture: aarch64   # 关键：指定 ARM64 架构
+
+      # 设置环境变量（Tessdata 标签）
+      - name: Set environment variable(s)
+        run: echo "TESSDATA_TAG=${{ steps.props.outputs.theTessdataTag }}" >> $GITHUB_ENV
+
+      # 缓存 Tessdata 文件，避免重复下载
+      - name: Get cached tessdata files
+        id: cache-tessdata
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.TESSDATA_PREFIX }}
+          key: ${{ runner.os }}-tessdata-${{ env.TESSDATA_TAG }}-eng
+
+      # 下载 Tessdata（如果缓存未命中）
+      - name: Install tessdata files
+        if: steps.cache-tessdata.outputs.cache-hit != 'true'
         run: |
-          java -version
-          java -XshowSettings:properties -version 2>&1 | grep os.arch
+          ${GITHUB_WORKSPACE}/.github/install-tessdata.sh eng
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+      # 构建（跳过测试，与官方 CI 一致）
+      - name: Build Audiveris
+        uses: gradle/gradle-build-action@v2.7.0
+        with:
+          arguments: build -x test
 
-      - name: Build with Gradle (ARM64)
-        run: ./gradlew build --no-daemon --stacktrace
+      # 运行单元测试（可选，确保质量）
+      - name: Unit-Test Audiveris
+        uses: gradle/gradle-build-action@v2.7.0
+        with:
+          arguments: test
 
-      - name: Prepare Termux package structure
+      # 生成完整的分发目录（installDist）
+      - name: Create installation distribution
+        uses: gradle/gradle-build-action@v2.7.0
+        with:
+          arguments: installDist
+
+      # 打包为 Termux 可用格式
+      - name: Prepare Termux package
         run: |
-          mkdir -p termux-package/audiveris/bin
-          mkdir -p termux-package/audiveris/lib
-          cp app/build/libs/audiveris-*.jar termux-package/audiveris/lib/
+          # 查找 installDist 生成的目录
+          if [ -d "app/build/install/audiveris" ]; then
+            INSTALL_DIR="app/build/install/audiveris"
+          elif [ -d "build/install/audiveris" ]; then
+            INSTALL_DIR="build/install/audiveris"
+          else
+            echo "ERROR: Cannot find install directory"
+            exit 1
+          fi
+
+          mkdir -p termux-package
+          cp -r "$INSTALL_DIR" termux-package/audiveris
+
+          # 重写启动脚本，适配 Termux 环境
           cat > termux-package/audiveris/bin/audiveris << 'EOF'
           #!/data/data/com.termux/files/usr/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          BASE_DIR="$(dirname "$SCRIPT_DIR")"
+          APP_HOME="$(dirname "$SCRIPT_DIR")"
           JAVA_CMD="${JAVA_HOME}/bin/java"
           if [ ! -x "$JAVA_CMD" ]; then
               JAVA_CMD="java"
           fi
-          # 可选：设置 TESSDATA_PREFIX 环境变量（Termux 中 tesseract 数据路径）
+          # 设置 Tesseract 数据路径（Termux 默认位置）
           export TESSDATA_PREFIX="/data/data/com.termux/files/usr/share/tessdata"
-          exec "$JAVA_CMD" -jar "$BASE_DIR"/lib/audiveris-*.jar "$@"
+          # JVM 参数（可根据设备调整）
+          JVM_OPTS="-Xmx1024m"
+          MAIN_CLASS="org.audiveris.app.Main"
+          exec "$JAVA_CMD" $JVM_OPTS -cp "$APP_HOME/lib/*" $MAIN_CLASS "$@"
           EOF
           chmod +x termux-package/audiveris/bin/audiveris
 
-      - name: Create tar.gz archive
+      # 打包为 tar.gz
+      - name: Create archive
         run: |
           cd termux-package
-          tar -czf audiveris-termux-arm64.tar.gz audiveris/
-          mv audiveris-termux-arm64.tar.gz ../
+          tar -czf ../audiveris-termux-arm64.tar.gz audiveris/
+          cd ..
+          ls -lh audiveris-termux-arm64.tar.gz
 
-      - name: Upload artifact (for manual download)
+      # 上传为 Actions Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: audiveris-termux-arm64
           path: audiveris-termux-arm64.tar.gz
+          retention-days: 30
 
-      - name: Upload to release (if release triggered)
+      # 如果是 Release 触发，自动上传到 Release
+      - name: Upload to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v1
         with:
