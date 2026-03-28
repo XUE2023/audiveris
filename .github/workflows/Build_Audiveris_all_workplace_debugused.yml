@@ -1,5 +1,4 @@
-name: Build for Termux (ARM64) and Upload to Release（all_workspace Uesd_debug）
-
+name: Build Audiveris for Termux (ARM64)
 
 on:
   push:
@@ -16,22 +15,24 @@ on:
         default: 'development'
 
 permissions:
-  contents: write
+  contents: write   # 允许创建/更新 Release
 
 jobs:
   build-termux-arm64:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04-arm   # 原生 ARM64 运行器
 
     env:
       TESSDATA_PREFIX: /home/runner/.config/AudiverisLtd/audiveris/tessdata
 
     steps:
+      # 1. 检出代码（支持手动输入分支或 Release tag）
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || (github.event_name == 'release' && github.event.release.tag_name || '') }}
           fetch-depth: 0
 
+      # 2. 读取 gradle.properties 中的 Java 版本和 Tesseract 数据标签
       - name: Retrieve Gradle properties
         uses: BrycensRanch/read-properties-action@v1
         id: props
@@ -39,6 +40,7 @@ jobs:
           file: gradle.properties
           all: true
 
+      # 3. 安装 ARM64 版本的 JDK（项目要求的最低版本）
       - name: Setup Java ${{ steps.props.outputs.theMinJavaVersion }} (ARM64)
         uses: actions/setup-java@v5
         with:
@@ -46,9 +48,11 @@ jobs:
           distribution: 'zulu'
           architecture: aarch64
 
+      # 4. 设置 Tesseract 数据标签环境变量
       - name: Set environment variable(s)
         run: echo "TESSDATA_TAG=${{ steps.props.outputs.theTessdataTag }}" >> $GITHUB_ENV
 
+      # 5. 缓存 Tesseract 数据文件
       - name: Get cached tessdata files
         id: cache-tessdata
         uses: actions/cache@v5
@@ -56,111 +60,80 @@ jobs:
           path: ${{ env.TESSDATA_PREFIX }}
           key: ${{ runner.os }}-tessdata-${{ env.TESSDATA_TAG }}-eng
 
+      # 6. 下载 Tesseract 数据（如果缓存未命中）
       - name: Install tessdata files
         if: steps.cache-tessdata.outputs.cache-hit != 'true'
         run: |
           ${GITHUB_WORKSPACE}/.github/install-tessdata.sh eng
 
+      # 7. 构建项目（跳过测试以加速，但保留测试步骤）
       - name: Build Audiveris
         uses: gradle/gradle-build-action@v2.7.0
         with:
           arguments: build -x test
 
+      # 8. 运行单元测试（确保代码质量）
       - name: Unit-Test Audiveris
         uses: gradle/gradle-build-action@v2.7.0
         with:
           arguments: test
 
+      # 9. 生成可运行的分发目录（installDist）
       - name: Create installation distribution
         uses: gradle/gradle-build-action@v2.7.0
         with:
           arguments: installDist
 
-      # ========== 详细调试：打印完整目录树 ==========
-      - name: Debug - Full directory tree
+      # ========== 轻量级调试：打包安装目录 (installpath) ==========
+      - name: Package install directory for debugging (installpath)
         run: |
-          echo "=== Full workspace tree (first 5 levels) ==="
-          find . -maxdepth 5 -type d | sort | sed 's/^/  /'
-          echo ""
-          echo "=== Looking for directories named 'audiveris' ==="
-          find . -type d -name "audiveris" | sort
-          echo ""
-          echo "=== Looking for potential install directories (containing bin and lib) ==="
-          find . -type d -exec test -d {}/bin -a -d {}/lib \; -print
-          echo ""
-          echo "=== Checking app/build/install ==="
-          ls -la app/build/install/ 2>/dev/null || echo "app/build/install does not exist"
-          echo "=== Checking build/install ==="
-          ls -la build/install/ 2>/dev/null || echo "build/install does not exist"
-          echo "=== Checking for any .jar files in build output ==="
-          find . -name "*.jar" -path "*/build/libs/*" | head -20
+          # 方法1：寻找同时包含 bin 和 lib 的目录（典型的分发结构）
+          INSTALL_DIR=$(find . -type d -exec test -d {}/bin -a -d {}/lib \; -print | grep -v "/\.gradle" | head -n 1)
+          if [ -z "$INSTALL_DIR" ]; then
+            # 方法2：寻找路径中包含 build/install/audiveris 的目录
+            INSTALL_DIR=$(find . -type d -path "*/build/install/audiveris" | head -n 1)
+          fi
+          if [ -z "$INSTALL_DIR" ]; then
+            # 方法3：直接检查常见位置
+            if [ -d "app/build/install/audiveris" ]; then
+              INSTALL_DIR="app/build/install/audiveris"
+            elif [ -d "build/install/audiveris" ]; then
+              INSTALL_DIR="build/install/audiveris"
+            fi
+          fi
 
-      # ========== 始终上传整个工作空间（排除缓存）以便分析 ==========
-      - name: Package workspace for debugging (always)
-        run: |
-          mkdir -p debug-workspace
-          rsync -av --exclude='.git' \
-                      --exclude='.gradle' \
-                      --exclude='**/build/tmp' \
-                      --exclude='**/build/.transforms' \
-                      --exclude='gradle/wrapper/gradle-*.zip' \
-                      ./ debug-workspace/
-          tar -czf workspace-debug.tar.gz -C debug-workspace .
+          if [ -n "$INSTALL_DIR" ]; then
+            echo "Found install directory: $INSTALL_DIR"
+            echo "INSTALL_DIR=$INSTALL_DIR" >> $GITHUB_OUTPUT
+            # 打包该目录（仅打包安装目录本身，不包含上层路径）
+            tar -czf installpath-debug.tar.gz -C "$(dirname "$INSTALL_DIR")" "$(basename "$INSTALL_DIR")"
+          else
+            echo "No install directory found. Creating empty artifact."
+            echo "No install directory found" > installpath-debug.txt
+            tar -czf installpath-debug.tar.gz installpath-debug.txt
+          fi
+        id: debug-install
         continue-on-error: true
 
-      - name: Upload workspace debug artifact
+      - name: Upload install debug artifact (installpath)
         uses: actions/upload-artifact@v4
         with:
-          name: workspace-debug
-          path: workspace-debug.tar.gz
+          name: installpath-debug
+          path: installpath-debug.tar.gz
           retention-days: 3
         continue-on-error: true
 
-      # ========== 尝试定位安装目录（使用更宽松的条件） ==========
-      - name: Locate install directory (fallback)
-        id: locate
-        run: |
-          # 方法1：寻找包含 bin 和 lib 的目录（这是典型的分发结构）
-          INSTALL_DIR=$(find . -type d -exec test -d {}/bin -a -d {}/lib \; -print | grep -v "/\.gradle" | head -n 1)
-          if [ -n "$INSTALL_DIR" ]; then
-            echo "Found install directory via bin+lib: $INSTALL_DIR"
-            echo "INSTALL_DIR=$INSTALL_DIR" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 方法2：寻找 audiveris 目录
-          INSTALL_DIR=$(find . -type d -name "audiveris" -path "*/install/*" | head -n 1)
-          if [ -n "$INSTALL_DIR" ]; then
-            echo "Found install directory via audiveris name: $INSTALL_DIR"
-            echo "INSTALL_DIR=$INSTALL_DIR" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 方法3：检查 app/build/install
-          if [ -d "app/build/install/audiveris" ]; then
-            echo "Found at app/build/install/audiveris"
-            echo "INSTALL_DIR=app/build/install/audiveris" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 方法4：检查 build/install
-          if [ -d "build/install/audiveris" ]; then
-            echo "Found at build/install/audiveris"
-            echo "INSTALL_DIR=build/install/audiveris" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          echo "No install directory found. See workspace-debug artifact for inspection."
-          exit 1
-
+      # ========== 准备 Termux 可运行包 ==========
+      # 注意：此步骤依赖上一步中输出的 INSTALL_DIR，若上一步未找到，则跳过
       - name: Prepare Termux package
-        if: steps.locate.outputs.INSTALL_DIR != ''
+        if: steps.debug-install.outputs.INSTALL_DIR != ''
         run: |
-          INSTALL_DIR="${{ steps.locate.outputs.INSTALL_DIR }}"
+          INSTALL_DIR="${{ steps.debug-install.outputs.INSTALL_DIR }}"
           echo "Using $INSTALL_DIR"
           mkdir -p termux-package
           cp -r "$INSTALL_DIR" termux-package/audiveris
 
+          # 重写启动脚本，适配 Termux 环境
           cat > termux-package/audiveris/bin/audiveris << 'EOF'
           #!/data/data/com.termux/files/usr/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -176,24 +149,26 @@ jobs:
           EOF
           chmod +x termux-package/audiveris/bin/audiveris
 
-      - name: Create archive
-        if: steps.locate.outputs.INSTALL_DIR != ''
+      - name: Create final archive
+        if: steps.debug-install.outputs.INSTALL_DIR != ''
         run: |
           cd termux-package
           tar -czf ../audiveris-termux-arm64.tar.gz audiveris/
           cd ..
           ls -lh audiveris-termux-arm64.tar.gz
 
-      # ========== 上传到 Release（仅在成功生成 archive 时执行） ==========
+      # ========== 上传到 Release ==========
+      # 如果是 Release 事件，直接上传到该 Release
       - name: Upload to release (if triggered by release)
-        if: github.event_name == 'release' && success() && steps.locate.outputs.INSTALL_DIR != ''
+        if: github.event_name == 'release' && success() && steps.debug-install.outputs.INSTALL_DIR != ''
         uses: softprops/action-gh-release@v1
         with:
           files: audiveris-termux-arm64.tar.gz
           tag_name: ${{ github.event.release.tag_name }}
 
+      # 如果是 push 到主分支或手动触发，则上传到 nightly 预发布（固定名称，自动创建/更新）
       - name: Upload to nightly release (for continuous builds)
-        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && success() && steps.locate.outputs.INSTALL_DIR != ''
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && success() && steps.debug-install.outputs.INSTALL_DIR != ''
         uses: softprops/action-gh-release@v1
         with:
           tag_name: nightly
