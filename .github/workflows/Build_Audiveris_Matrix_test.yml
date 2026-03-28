@@ -7,7 +7,6 @@ on:
     branches: [ development, master ]
   release:
     types: [ created ]
-  # 可选：手动触发，允许指定分支
   workflow_dispatch:
     inputs:
       branch:
@@ -23,16 +22,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # 对于手动触发，使用输入的分支；对于 release，检出对应的 tag；否则使用触发事件的分支（默认行为）
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || (github.event_name == 'release' && github.event.release.tag_name || '') }}
-          # 如果 ref 为空，将自动使用触发工作流的分支/提交
 
-      - name: Set up JDK 21
+      - name: Set up JDK 25 (Early Access)
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '21'
-          # 若需要 Java 25（早期版本），可改为 '25'，但 temurin-25 可能不稳定
+          distribution: 'temurin'    # Eclipse Adoptium Temurin 提供 EA 版本
+          java-version: '25-ea'
+          check-latest: true
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -44,12 +41,9 @@ jobs:
         run: |
           mkdir -p termux-package/audiveris/bin
           mkdir -p termux-package/audiveris/lib
-          # 复制主 jar 文件（支持版本号通配符）
           cp app/build/libs/audiveris-*.jar termux-package/audiveris/lib/
-          # 创建启动脚本
           cat > termux-package/audiveris/bin/audiveris << 'EOF'
           #!/data/data/com.termux/files/usr/bin/bash
-          # Termux 启动脚本
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           BASE_DIR="$(dirname "$SCRIPT_DIR")"
           JAVA_CMD="${JAVA_HOME}/bin/java"
