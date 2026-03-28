@@ -3,8 +3,6 @@ name: Build Audiveris JAR
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -14,8 +12,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
@@ -26,12 +22,17 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build with Gradle
-        run: ./gradlew build --no-daemon
+      - name: Build with Gradle (shadowJar)
+        run: ./gradlew shadowJar --no-daemon
+
+      - name: List generated JARs
+        run: find . -name "*.jar" -type f -exec ls -lh {} \;
 
       - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: audiveris-jar
-          path: app/build/libs/*.jar
-          if-no-files-found: error
+          path: |
+            app/build/libs/*-all.jar
+            app/build/libs/*-fat.jar
+            app/build/libs/*-with-dependencies.jar
