@@ -1,10 +1,7 @@
-name: Build Audiveris and Release
+name: Build & Release Audiveris
 
 on:
-  push:
-    tags:
-      - 'v*'
-      - 'audiveris-*'
+  workflow_dispatch:  # 允许手动点一下运行
 
 jobs:
   build:
@@ -24,15 +21,20 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Build Audiveris
+      - name: Build with Gradle
         run: ./gradlew distZip
 
-      - name: List build files
-        run: ls -la app/build/distributions/
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audiveris-build
+          path: app/build/distributions/*.zip
 
-      - name: Upload binaries to release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: auto-build-${{ github.sha }}
+          name: Auto build ${{ github.sha }}
           files: app/build/distributions/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
