@@ -1,0 +1,139 @@
+name: Build for Termux (ARM64) and Upload to Release（all_workspace Uesd_debug）
+
+on:
+  push:
+    branches: [ development, master ]
+  pull_request:
+    branches: [ development, master ]
+  release:
+    types: [ created ]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build'
+        required: true
+        default: 'development'
+
+permissions:
+  contents: write   # 允许创建/更新 Release
+
+jobs:
+  build-termux-arm64:
+    runs-on: ubuntu-24.04-arm
+
+    env:
+      TESSDATA_PREFIX: /home/runner/.config/AudiverisLtd/audiveris/tessdata
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || (github.event_name == 'release' && github.event.release.tag_name || '') }}
+          fetch-depth: 0
+
+      - name: Retrieve Gradle properties
+        uses: BrycensRanch/read-properties-action@v1
+        id: props
+        with:
+          file: gradle.properties
+          all: true
+
+      - name: Setup Java ${{ steps.props.outputs.theMinJavaVersion }} (ARM64)
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ steps.props.outputs.theMinJavaVersion }}
+          distribution: 'zulu'
+          architecture: aarch64
+
+      - name: Set environment variable(s)
+        run: echo "TESSDATA_TAG=${{ steps.props.outputs.theTessdataTag }}" >> $GITHUB_ENV
+
+      - name: Get cached tessdata files
+        id: cache-tessdata
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.TESSDATA_PREFIX }}
+          key: ${{ runner.os }}-tessdata-${{ env.TESSDATA_TAG }}-eng
+
+      - name: Install tessdata files
+        if: steps.cache-tessdata.outputs.cache-hit != 'true'
+        run: |
+          ${GITHUB_WORKSPACE}/.github/install-tessdata.sh eng
+
+      - name: Build Audiveris
+        uses: gradle/gradle-build-action@v2.7.0
+        with:
+          arguments: build -x test
+
+      - name: Unit-Test Audiveris
+        uses: gradle/gradle-build-action@v2.7.0
+        with:
+          arguments: test
+
+      - name: Create installation distribution
+        uses: gradle/gradle-build-action@v2.7.0
+        with:
+          arguments: installDist
+
+      - name: Locate install directory
+        id: locate
+        run: |
+          INSTALL_DIR=$(find . -type d -path "*/build/install/audiveris" | head -n 1)
+          if [ -z "$INSTALL_DIR" ]; then
+            echo "No install directory found. Listing potential paths:"
+            find . -type d -name "audiveris" | grep -E "(install|dist)" || true
+            exit 1
+          fi
+          echo "Found install directory: $INSTALL_DIR"
+          echo "INSTALL_DIR=$INSTALL_DIR" >> $GITHUB_OUTPUT
+
+      - name: Prepare Termux package
+        run: |
+          INSTALL_DIR="${{ steps.locate.outputs.INSTALL_DIR }}"
+          echo "Using $INSTALL_DIR"
+          mkdir -p termux-package
+          cp -r "$INSTALL_DIR" termux-package/audiveris
+
+          cat > termux-package/audiveris/bin/audiveris << 'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          APP_HOME="$(dirname "$SCRIPT_DIR")"
+          JAVA_CMD="${JAVA_HOME}/bin/java"
+          if [ ! -x "$JAVA_CMD" ]; then
+              JAVA_CMD="java"
+          fi
+          export TESSDATA_PREFIX="/data/data/com.termux/files/usr/share/tessdata"
+          JVM_OPTS="-Xmx1024m"
+          MAIN_CLASS="org.audiveris.app.Main"
+          exec "$JAVA_CMD" $JVM_OPTS -cp "$APP_HOME/lib/*" $MAIN_CLASS "$@"
+          EOF
+          chmod +x termux-package/audiveris/bin/audiveris
+
+      - name: Create archive
+        run: |
+          cd termux-package
+          tar -czf ../audiveris-termux-arm64.tar.gz audiveris/
+          cd ..
+          ls -lh audiveris-termux-arm64.tar.gz
+
+      # ========== 上传到 Release ==========
+      # 如果是 Release 事件，直接上传到该 Release
+      - name: Upload to release (if triggered by release)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: audiveris-termux-arm64.tar.gz
+          tag_name: ${{ github.event.release.tag_name }}
+
+      # 如果是 push 到主分支或手动触发，则上传到 nightly Release（固定名称）
+      - name: Upload to nightly release (for continuous builds)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          files: audiveris-termux-arm64.tar.gz
+          # 如果该 Release 已存在，则会更新资产（覆盖同名文件）
+          # 如果不存在，则创建它
+          fail_on_unmatched_files: true
